@@ -1,0 +1,259 @@
+## Orthanc Configuration (`orthanc.json`)
+```json
+{
+  "Plugins" : [
+    "/usr/lib/orthanc/plugins/VisioScanRouterPlugin.so"
+  ],
+  "HttpServerEnabled" : true
+}
+```
+```
+
+--- go.mod ---
+```go
+module github.com/your-org/visioscan_router
+
+go 1.19
+
+require github.com/gin-gonic/gin v1.8.1
+```
+
+--- cmd/router/main.go ---
+```go
+package main
+
+import (
+    "context"
+    "encoding/json"
+    "log"
+    "net/http"
+    "os"
+    "os/signal"
+    "syscall"
+    "time"
+
+    "github.com/gin-gonic/gin"
+    "github.com/your-org/visioscan_router/pkg/buffer"
+    "github.com/your-org/visioscan_router/pkg/dispatcher"
+)
+
+type StudyEvent struct {
+    StudyInstanceUID string                 `json:"StudyInstanceUID"`
+    Timestamp        int64                  `json:"Timestamp"`
+    Metadata         map[string]interface{} `json:"Metadata"`
+}
+
+func main() {
+    router := gin.Default()
+    
+    // Hook endpoint for Orthanc plugin
+    router.POST("/hooks/study", func(c *gin.Context) {
+        var evt StudyEvent
+        if err := c.BindJSON(&evt); err != nil {
+            c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+            return
+        }
+        // Try immediate dispatch
+        go func(e StudyEvent) {
+            if err := dispatcher.Dispatch(e); err != nil {
+                log.Printf("Dispatch failed, buffering: %v", err)
+                buffer.Enqueue(buffer.Event{e.StudyInstanceUID, e.Timestamp, e.Metadata})
+            }
+        }(evt)
+        c.Status(http.StatusAccepted)
+    })
+
+    // Worker to retry buffered events
+    go func() {
+        ticker := time.NewTicker(30 * time.Second)
+        for range ticker.C {
+            for {
+                evt, err := buffer.Dequeue()
+                if err != nil {
+                    log.Printf("Buffer dequeue error: %v", err)
+                    break
+                }
+                if evt == nil {
+                    break
+                }
+                if err := dispatcher.Dispatch(evt); err != nil {
+                    log.Printf("Retry failed, re-buffering: %v", err)
+                    buffer.Enqueue(*evt)
+                    break
+                }
+            }
+        }
+    }()
+
+    srv := &http.Server{
+        Addr:    ":8080",
+        Handler: router,
+    }
+
+    // Start server
+    go func() {
+        if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+            log.Fatalf("Server error: %v", err)
+        }
+    }()
+    log.Println("Router listening on :8080")
+
+    // Graceful shutdown
+    quit := make(chan os.Signal, 1)
+    signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+    <-quit
+    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancel()
+    if err := srv.Shutdown(ctx); err != nil {
+        log.Fatalf("Server forced to shutdown: %v", err)
+    }
+}
+```
+
+--- pkg/buffer/buffer.go ---
+```go
+package buffer
+
+import (
+    "encoding/json"
+    "fmt"
+    "io/ioutil"
+    "os"
+    "path/filepath"
+    "sync"
+    "time"
+)
+
+type Event struct {
+    StudyInstanceUID string                 `json:"studyInstanceUID"`
+    Timestamp        int64                  `json:"timestamp"`
+    Data             map[string]interface{} `json:"data"`
+}
+
+var (
+    bufferDir = "buffer"
+    mu        sync.Mutex
+)
+
+func init() {
+    os.MkdirAll(bufferDir, os.ModePerm)
+}
+
+func Enqueue(evt Event) error {
+    mu.Lock()
+    defer mu.Unlock()
+    fname := filepath.Join(bufferDir, fmt.Sprintf("%s_%d.json", evt.StudyInstanceUID, evt.Timestamp))
+    b, err := json.Marshal(evt)
+    if err != nil {
+        return err
+    }
+    return ioutil.WriteFile(fname, b, 0644)
+}
+
+func Dequeue() (*Event, error) {
+    mu.Lock()
+    defer mu.Unlock()
+    files, err := ioutil.ReadDir(bufferDir)
+    if err != nil {
+        return nil, err
+    }
+    if len(files) == 0 {
+        return nil, nil
+    }
+    f := files[0]
+    path := filepath.Join(bufferDir, f.Name())
+    data, err := ioutil.ReadFile(path)
+    if err != nil {
+        return nil, err
+    }
+    var evt Event
+    if err := json.Unmarshal(data, &evt); err != nil {
+        return nil, err
+    }
+    os.Remove(path)
+    return &evt, nil
+}
+```
+
+--- pkg/dispatcher/dispatcher.go ---
+```go
+package dispatcher
+
+import (
+    "bytes"
+    "encoding/json"
+    "fmt"
+    "net/http"
+)
+
+const GPUURL = "http://gpu-engine:8000/process"
+
+func Dispatch(evt interface{}) error {
+    b, err := json.Marshal(evt)
+    if err != nil {
+        return err
+    }
+    resp, err := http.Post(GPUURL, "application/json", bytes.NewReader(b))
+    if err != nil {
+        return err
+    }
+    defer resp.Body.Close()
+    if resp.StatusCode >= 400 {
+        return fmt.Errorf("GPU engine error: %v", resp.Status)
+    }
+    return nil
+}
+```
+
+--- pkg/orthanc_plugin/plugin.cpp ---
+```cpp
+#include "OrthancPlugin.h"
+#include <curl/curl.h>
+#include <json/json.h>
+#include <ctime>
+
+static std::string OnStoredInstance(
+    const OrthancPlugin* plugin,
+    const char* /*event*/, 
+    const char* instance,
+    const OrthancPluginDicomTags* /*tags*/)
+{
+    Json::Value root;
+    root["StudyInstanceUID"] = OrthancPluginGetStudyInstanceUID(plugin, instance);
+    root["Timestamp"] = (Json::Int64)std::time(nullptr);
+    Json::StreamWriterBuilder writer;
+    std::string body = Json::writeString(writer, root);
+
+    CURL* curl = curl_easy_init();
+    if (curl) {
+        curl_easy_setopt(curl, CURLOPT_URL, "http://localhost:8080/hooks/study");
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
+        curl_easy_perform(curl);
+        curl_easy_cleanup(curl);
+    }
+    return std::string();
+}
+
+ORTHANC_PLUGINS_API void OrthancPluginInitialize(OrthancPlugin* plugin)
+{
+    plugin->SetName("VisioScanRouter");
+    plugin->SetDescription("Forwards new studies to VISIOSCAN router");
+    plugin->SetVersion("0.1.0");
+    plugin->SetRequiredOrthancVersion("1.7.0");
+    plugin->SetOnStoredInstanceCallback(OnStoredInstance);
+}
+```
+
+--- pkg/orthanc_plugin/CMakeLists.txt ---
+```cmake
+cmake_minimum_required(VERSION 3.10)
+project(VisioScanRouterPlugin)
+
+find_package(Orthanc REQUIRED)
+find_package(CURL REQUIRED)
+find_package(JsonCpp REQUIRED)
+
+add_library(VisioScanRouterPlugin MODULE plugin.cpp)
+target_include_directories(VisioScanRouterPlugin PRIVATE ${ORTHANC_INCLUDE_DIRS} ${CURL_INCLUDE_DIRS} ${JSONCPP_INCLUDE_DIRS})
+target_link_libraries(VisioScanRouterPlugin PRIVATE ${ORTHANC_LIBRARIES} CURL::libcurl jsoncpp)
+```
